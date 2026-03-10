@@ -1,0 +1,52 @@
+services:
+  # 🕷️ Le Crawler (TitanPro)
+  crawler:
+    build: .
+    container_name: titan_spider
+    restart: always
+    depends_on:
+      - redis
+      - mongodb
+    environment:
+      - REDIS_HOST=redis:6379
+      - MONGO_URI=mongodb://mongodb:27017/
+    volumes:
+      - ./data/output:/app/data/output
+      - .:/app  # Montage pour le développement (sync le code)
+    # Important pour Playwright dans Docker
+    shm_size: '2gb' 
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ⚡ Le moteur de file d'attente (Redis 7)
+  redis:
+    image: redis:7-alpine
+    container_name: titan_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+
+  # 🍃 La base de données (MongoDB)
+  mongodb:
+    image: mongo:latest
+    container_name: titan_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  # 📊 Interface Redis (Optionnel mais génial pour voir la queue en direct)
+  redis-insight:
+    image: redislabs/redisinsight:latest
+    ports:
+      - "8001:8001"
+    restart: always
+
+volumes:
+  mongo_data:
+  redis_data:
