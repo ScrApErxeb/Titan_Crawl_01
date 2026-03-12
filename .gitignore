@@ -1,8 +1,8 @@
-__pycache__/
+venv
+venv/
+__pycache__
 *.pyc
-.env
-.docker/
+*.pyo
+
+# Logs and temporary files
 logs/
-data/
-.idea/
-.vscode/

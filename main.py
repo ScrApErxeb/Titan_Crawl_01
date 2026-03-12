@@ -1,106 +1,131 @@
 import asyncio
-import signal
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+import logging
+import json
 
-# On utilise les versions asynchrones des bibliothèques
-from motor.motor_asyncio import AsyncIOMotorClient
-from redis import asyncio as aioredis
+from config import Config
+from database import DatabaseManager
+from fetchers import HttpFetcher, Action
+from parsers import GenericParser
+from pipeline import PipelineManager
 
-# Tes modules locaux
-from fetcher.http_fetcher import HttpFetcher
-from parser.generic_parser import GenericParser
-from pipeline.cleaner import Cleaner
-from pipeline.manager import PipelineManager
-from config.settings import Config
+logging.basicConfig(
+    level=getattr(logging, Config.LOG_LEVEL),
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+# Réduire le bruit de logs provenant des bibliothèques externes (p.ex. heartbeats
+# pymongo, sortie verbose d'urllib3/httpx, ou logs debug d'asyncio). Conserver
+# le niveau configuré pour l'application via Config.LOG_LEVEL.
+# On met ces loggers dépendances en WARNING pour éviter d'avoir trop de DEBUG/INFO.
+for noisy in (
+    "pymongo",
+    "pymongo.monitoring",
+    "motor",
+    "urllib3",
+    "urllib3.connectionpool",
+    "httpx",
+    "asyncio",
+    "boto3",
+    "botocore",
+):
+    try:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    except Exception:
+        # Ne pas échouer si un logger n'existe pas
+        pass
+
 
 class TitanCrawler:
+
     def __init__(self):
-        # 1 & 4. Connexions Asynchrones Unifiées
-        self.redis = aioredis.from_url(
-            f"redis://{Config.REDIS_HOST}", 
-            decode_responses=True
-        )
-        self.mongo_client = AsyncIOMotorClient(Config.MONGO_URI)
-        self.db = self.mongo_client[Config.DB_NAME]
-        
-        # 3. Fetcher avec Pool de connexions
-        self.fetcher = HttpFetcher()
+        self.db = DatabaseManager()
+        self.fetcher = HttpFetcher(Config.USER_AGENTS)
         self.parser = GenericParser()
-        self.cleaner = Cleaner()
-        self.pipeline = PipelineManager(self.cleaner)
+        self.pipeline = PipelineManager()
 
-        # 7. Sécurité : Whitelist de domaines
-        self.allowed_domains = {
-            "news.ycombinator.com", "wikipedia.org", 
-            "reuters.com", "bbc.com", "github.com", "dev.to"
-        }
-        self.max_links_per_page = Config.CONCURRENT_THREADS * 2
-        self.is_running = True
+    async def process_url(self, job):
 
-# ... (Gardes tes imports et ton __init__ identiques) ...
+        job_data = json.loads(job)
+        url = job_data["url"]
+        depth = job_data["depth"]
 
-    async def worker(self, worker_id: int):
-        print(f"👷 Worker {worker_id} : Lancé à pleine balle.")
-        
-        while self.is_running:
+        if await self.db.is_visited(url):
+            return
+
+        logger.info(f"🌐 Crawling {url} (depth={depth})")
+
+        result = await self.fetcher.fetch(url)
+
+        if result["action"] != Action.SUCCESS:
+            logger.warning(f"⚠️ Fetch failed {url}")
+            return
+
+        html = result["html"]
+
+        raw_item = self.parser.parse(html, url)
+
+        processed = self.pipeline.process_item(raw_item, url)
+
+        if not processed:
+            return
+
+        saved = await self.db.save_item(processed)
+
+        if not saved:
+            return
+
+        # Ajout des nouveaux liens
+        for link in processed.get("links", []):
+            await self.db.add_to_queue(link, depth + 1)
+
+    async def worker(self):
+
+        while True:
+
+            job = await self.db.get_next_url()
+
+            if not job:
+                await asyncio.sleep(1)
+                continue
+
             try:
-                job = await self.redis.brpop("url_queue", timeout=5)
-                if not job: continue
-                url = job[1]
-
-                if not await self.redis.sadd("crawled_urls", url):
-                    continue
-
-                html = await self.fetcher.fetch(url)
-                if not html: continue
-
-                raw_data = self.parser.parse(html, url)
-                clean_data = self.pipeline.process_item(raw_data, url)
-
-                if clean_data:
-                    await self.db.scraped_data.update_one(
-                        {"url": url}, {"$set": clean_data}, upsert=True
-                    )
-
-                    # 🔥 EXPLORATION ILLIMITÉE ICI
-                    links = raw_data.get("links", [])
-                    for link in links[:50]: # On prend les 50 premiers liens par page
-                        # On vérifie juste si on l'a déjà vu, c'est tout !
-                        if not await self.redis.sismember("crawled_urls", link):
-                            await self.redis.lpush("url_queue", link)
+                await self.process_url(job)
 
             except Exception as e:
-                print(f"🔥 Erreur Worker {worker_id} : {e}")
-            
-            await asyncio.sleep(0.1) # On réduit le délai au minimum
-    async def shutdown(self, sig=None):
-        """Arrêt propre des connexions"""
-        print(f"\n🛑 Signal {sig} reçu. Fermeture des vannes...")
-        self.is_running = False
-        await self.fetcher.close()
-        self.mongo_client.close()
-        await self.redis.close()
-        print("👋 TitanPro s'est arrêté proprement.")
+                logger.error(f"❌ Worker error: {e}", exc_info=True)
+
+            await asyncio.sleep(Config.CRAWL_DELAY)
 
     async def run(self):
-        num_workers = Config.CONCURRENT_THREADS
-        print(f"🚀 Démarrage de {Config.APP_NAME}")
-        print(f"⚙️  Cibles : {list(self.allowed_domains)}")
 
-        # Lancement des workers en parallèle
-        workers = [self.worker(i) for i in range(num_workers)]
+        logger.info("🚀 TitanPro crawler starting...")
+
+        await self.db.init_db()
+
+        workers = [
+            asyncio.create_task(self.worker())
+            for _ in range(Config.CONCURRENT_THREADS)
+        ]
+
         await asyncio.gather(*workers)
 
-if __name__ == "__main__":
-    crawler = TitanCrawler()
-    loop = asyncio.get_event_loop()
 
-    # Gestion propre de l'arrêt (Ctrl+C)
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(crawler.shutdown(sig)))
+async def main():
+
+    crawler = TitanCrawler()
 
     try:
-        loop.run_until_complete(crawler.run())
-    except Exception as e:
-        print(f"Dernière erreur avant crash : {e}")
+        await crawler.run()
+
+    except KeyboardInterrupt:
+        logger.info("🛑 Shutdown crawler")
+
+    finally:
+        await crawler.fetcher.close()
+        await crawler.db.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,3 +1,4 @@
+
 services:
   # 🕷️ Le Crawler (TitanPro)
   crawler:
@@ -11,17 +12,16 @@ services:
       - REDIS_HOST=redis:6379
       - MONGO_URI=mongodb://mongodb:27017/
     volumes:
-      - ./data/output:/app/data/output
-      - .:/app  # Montage pour le développement (sync le code)
-    # Important pour Playwright dans Docker
-    shm_size: '2gb' 
+      - ./data/output:/app/data/output   # Stockage local des résultats
+      - .:/app                           # Montage du code pour dev en temps réel
+    shm_size: '2gb'                       # Important pour Playwright
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
 
-  # ⚡ Le moteur de file d'attente (Redis 7)
+  # ⚡ Redis – moteur de queue
   redis:
     image: redis:7-alpine
     container_name: titan_redis
@@ -31,7 +31,7 @@ services:
     volumes:
       - redis_data:/data
 
-  # 🍃 La base de données (MongoDB)
+  # 🍃 MongoDB – stockage des données
   mongodb:
     image: mongo:latest
     container_name: titan_mongo
@@ -40,13 +40,14 @@ services:
     volumes:
       - mongo_data:/data/db
 
-  # 📊 Interface Redis (Optionnel mais génial pour voir la queue en direct)
+  # 📊 Redis Insight – interface optionnelle pour monitorer la queue
   redis-insight:
     image: redislabs/redisinsight:latest
     ports:
       - "8001:8001"
     restart: always
 
+# 📦 Volumes persistants
 volumes:
   mongo_data:
   redis_data:
